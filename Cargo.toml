@@ -5,3 +5,5 @@ authors = ["Marco Munizaga <marco@marcopolo.io>"]
 
 [dependencies]
 slack = "0.13.0"
+rustc-serialize = "0.3.18"
+sodiumoxide = "0.0.9"
