@@ -19,10 +19,13 @@ use rustc_serialize::base64::FromBase64;
 use sodiumoxide::crypto::secretbox;
 use sodiumoxide::crypto::pwhash;
 use sodiumoxide::crypto::box_;
+use sodiumoxide::crypto::box_::curve25519xsalsa20poly1305::PUBLICKEYBYTES;
+use sodiumoxide::crypto::box_::curve25519xsalsa20poly1305::SECRETKEYBYTES;
 
 use std::io::BufRead;
 
-const APP_SALT: [u8; 32] = [10, 114, 205, 187, 185, 221, 149, 162, 162, 65, 134, 167, 216, 87, 26, 195, 184, 203, 106, 155, 0, 243, 142, 180, 223, 88, 83, 179, 230, 4, 217, 25];
+// Nonce is null because we use a random ephemeral public key for every write.
+const NULL_NONCE: box_::Nonce = box_::Nonce([0; box_::NONCEBYTES]);
 
 const B64_CONFIG: base64::Config = base64::Config{
     char_set: base64::UrlSafe,
@@ -36,7 +39,7 @@ const B64_CONFIG: base64::Config = base64::Config{
 
 #[derive(Debug)]
 pub struct WrappedData {
-    ephemeral_pub_key: [u8; 24],
+    ephemeral_pub_key: [u8; PUBLICKEYBYTES],
     data: Vec<u8>,
 }
 
@@ -54,7 +57,7 @@ fn to_wrapped_data(line: &str) -> Result<WrappedData, base64::FromBase64Error> {
     if let (Some(pk_str), Some(data_str)) = (words.next(), words.next()) {
         let pk = try!(pk_str.from_base64());
         let data = try!(data_str.from_base64());
-        let mut sized_pk: [u8; 24] = [0; 24];
+        let mut sized_pk: [u8; PUBLICKEYBYTES] = [0; PUBLICKEYBYTES];
         for (a, b) in sized_pk.iter_mut().zip(pk.into_iter()) {
             *a = b;
         }
@@ -76,7 +79,7 @@ struct MyHandler {
     user_map: HashMap<String, slack::User>,
     log_file: String,
     raw_log_file: String,
-    key: secretbox::Key,
+    their_pk: box_::PublicKey,
 }
 
 fn find_user (cli: &slack::RtmClient, uid: String) -> Option<slack::User> {
@@ -87,7 +90,7 @@ fn find_channel (cli: &slack::RtmClient, cid: String) -> Option<slack::Channel> 
     cli.get_channels().into_iter().find(|c| c.id == cid)
 }
 
-fn append_chat_log (key: &secretbox::Key, log: &SimpleLog, location: &String) -> Result<(), io::Error> {
+fn append_chat_log (key: &box_::PublicKey, log: &SimpleLog, location: &String) -> Result<(), io::Error> {
     if let Ok(json_log) = json::encode(log) {
         append_str_log(key, json_log.as_str(), location)
     } else {
@@ -95,27 +98,27 @@ fn append_chat_log (key: &secretbox::Key, log: &SimpleLog, location: &String) ->
     }
 }
 
-fn wrap_with_crypto (key: &secretbox::Key, plaintext: &str) -> Result<(Vec<u8>, [u8; 24]), io::Error> {
-    let nonce = secretbox::gen_nonce();
-    let ciphertext = secretbox::seal(plaintext.as_bytes(), &nonce, key);
+fn wrap_with_crypto (their_pk: &box_::PublicKey, plaintext: &[u8]) -> Result<(Vec<u8>, [u8; PUBLICKEYBYTES]), io::Error> {
+    let (ephemeral_pk, ephemeral_sk) = box_::gen_keypair();
+    let ciphertext = box_::seal(plaintext, &NULL_NONCE, their_pk, &ephemeral_sk);
+    let box_::PublicKey(ephemeral_pk_bytes) = ephemeral_pk;
 
-    let secretbox::xsalsa20poly1305::Nonce(nonce_bytes) = nonce;
-    Ok((ciphertext, nonce_bytes))
+    Ok((ciphertext, ephemeral_pk_bytes))
 }
 
-fn append_str_log (key: &secretbox::Key, s: &str, location: &String) -> Result<(), io::Error> {
+fn append_str_log (key: &box_::PublicKey, s: &str, location: &String) -> Result<(), io::Error> {
     let mut file = try!(OpenOptions::new().write(true).append(true).open(Path::new(location)));
-    let (ciphertext, nonce) = try!(wrap_with_crypto(key, s));
+    let (ciphertext, nonce) = try!(wrap_with_crypto(key, s.as_bytes()));
     let d = WrappedData{ephemeral_pub_key: nonce, data: ciphertext};
     try!(file.write_all(d.to_base64(B64_CONFIG).as_bytes()));
     try!(writeln!(file, ""));
     Ok(())
 }
 
-fn open_str (key: &secretbox::Key, line: &str) -> Option<String> {
+fn open_str (k: &box_::SecretKey, line: &str) -> Option<String> {
     if let Ok(wrapped_data) = to_wrapped_data(line) {
-        let nonce = secretbox::xsalsa20poly1305::Nonce(wrapped_data.ephemeral_pub_key);
-        if let Ok(pt) = secretbox::open(&wrapped_data.data[..], &nonce, key) {
+        let ephemeral_pub_key = box_::PublicKey(wrapped_data.ephemeral_pub_key);
+        if let Ok(pt) = box_::open(&wrapped_data.data[..], &NULL_NONCE, &ephemeral_pub_key, k) {
             if let Ok(s) = String::from_utf8(pt) {
                 return Some(s);
             }
@@ -135,12 +138,12 @@ impl slack::EventHandler for MyHandler {
                         match message.clone() {
                             slack::Message::Standard { text: Some(text), user: Some(user), channel: Some(channel), ..} => {
                                 if let (Some(u), Some(c)) = (find_user(&cli, user), find_channel(&cli, channel)){
-                                    match append_chat_log(&self.key, &SimpleLog{username: u.name, channel: c.name, text: text}, &self.log_file) {
+                                    match append_chat_log(&self.their_pk, &SimpleLog{username: u.name, channel: c.name, text: text}, &self.log_file) {
                                         Ok(_) => {},
                                         Err(e) => println!("Failed to write chat log: {:?}", e)
                                     }
 
-                                    match append_str_log(&self.key, raw_json, &self.raw_log_file) {
+                                    match append_str_log(&self.their_pk, raw_json, &self.raw_log_file) {
                                         Ok(_) => {},
                                         Err(e) => println!("Failed to write raw log: {:?}", e)
                                     }
@@ -189,40 +192,58 @@ fn run_handler (handler: &mut MyHandler, slack_token: &String) {
     }
 }
 
+fn read_from_env(env: &str) -> Vec<u8> {
+    match env::var(env).map(|s| { s.from_base64().unwrap() }) {
+        Ok(val) => val,
+        Err(_) => {
+            panic!("No {:?} set", env);
+        }
+    }
+}
+
+fn read_pub_key_from_env(env: &str) -> Option<box_::PublicKey> {
+    let pk_bytes: Vec<u8> = read_from_env(env);
+
+    let mut sized_pk: [u8; PUBLICKEYBYTES] = [0; PUBLICKEYBYTES];
+    for (a, b) in sized_pk.iter_mut().zip(pk_bytes.into_iter()) {
+        *a = b;
+    }
+    return Some(box_::PublicKey(sized_pk));
+}
+
+fn read_secret_key_from_env(env: &str) -> Option<box_::SecretKey> {
+    let sk_bytes: Vec<u8> = read_from_env(env);
+
+    let mut sized_pk: [u8; SECRETKEYBYTES] = [0; SECRETKEYBYTES];
+    for (a, b) in sized_pk.iter_mut().zip(sk_bytes.into_iter()) {
+        *a = b;
+    }
+    return Some(box_::SecretKey(sized_pk));
+}
+
 fn main() {
 
     if let Ok(_) = env::var("GEN_KEYPAIR") {
         let (pk, sk) = box_::gen_keypair();
-        let box_::curve25519xsalsa20poly1305::PublicKey(pk_bytes) = pk;
-        let box_::curve25519xsalsa20poly1305::SecretKey(sk_bytes) = sk;
+        let box_::PublicKey(pk_bytes) = pk;
+        let box_::SecretKey(sk_bytes) = sk;
 
         println!("Public Key: {:?}", pk_bytes.to_base64(B64_CONFIG));
         println!("Secret Key: {:?}", sk_bytes.to_base64(B64_CONFIG));
+
         process::exit(0);
     }
 
-    let crypto_key: String;
-    match env::var("NSA_CRYPTO_KEY") {
-        Ok(val) => crypto_key = val,
-        Err(_) => panic!("No NSA_CRYPTO_KEY set"),
-    }
-
-    let mut derived_key = secretbox::Key([0; secretbox::KEYBYTES]);
-    {
-        let secretbox::Key(ref mut kb) = derived_key;
-        pwhash::derive_key(kb, crypto_key.as_bytes(), &pwhash::scryptsalsa208sha256::Salt(APP_SALT),
-                           pwhash::OPSLIMIT_INTERACTIVE,
-                           pwhash::MEMLIMIT_INTERACTIVE).unwrap();
-    }
-
+    let public_key = read_pub_key_from_env("NSA_PUBLIC_KEY").unwrap();
 
     if let Ok(_) = env::var("NSA_DECRYPT") {
+        let secret_key = read_secret_key_from_env("NSA_SECRET_KEY").unwrap();
 
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
         let mut buffer = String::new();
         while stdin.read_line(&mut buffer).unwrap_or(0) > 0 {
-            println!("{:?}", open_str(&derived_key, buffer.as_str()).unwrap_or("None".to_string()));
+            println!("{:?}", open_str(&secret_key, buffer.as_str()).unwrap_or("None".to_string()));
             buffer.clear();
         }
 
@@ -235,30 +256,13 @@ fn main() {
         Err(_) => panic!("No NSA_SLACK_TOKEN set"),
     }
 
-
-    let (ourpk, oursk) = box_::gen_keypair();
-    let (theirpk, theirsk) = box_::gen_keypair();
-    let our_precomputed_key = box_::precompute(&theirpk, &oursk);
-    let nonce = box_::gen_nonce();
-    let plaintext = b"plaintext";
-    let ciphertext = box_::seal_precomputed(plaintext, &nonce, &our_precomputed_key);
-    // this will be identical to our_precomputed_key
-    let their_precomputed_key = box_::precompute(&ourpk, &theirsk);
-    let their_plaintext = box_::open_precomputed(&ciphertext, &nonce,
-                                                 &their_precomputed_key).unwrap();
-
-
-    //append_str_log(&derived_key, &"123 foobar", &"/tmp/asdf".to_string());
-    //append_str_log(&derived_key, &"foobar 123", &"/tmp/asdf".to_string());
-    //process::exit(0);
-
     match (env::var("NSA_LOG_FILE"), env::var("NSA_RAW_LOG_FILE")) {
         (Ok(log_file), Ok(raw_log_file)) => {
             let mut handler = MyHandler{
                 user_map: HashMap::new(),
                 log_file: log_file,
                 raw_log_file: raw_log_file,
-                key: derived_key
+                their_pk: public_key,
             };
 
             run_handler(&mut handler, &slack_token)
